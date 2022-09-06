@@ -165,10 +165,6 @@ def main_worker(gpu, ngpus, args):
             cur_iter += 1
 
             batch = [x.to(device) for x in batch]
-
-            x, y = batch
-            # assert False, [t.shape for t in batch]
-
             data_time += time.time() - start_time
 
             logs = {}

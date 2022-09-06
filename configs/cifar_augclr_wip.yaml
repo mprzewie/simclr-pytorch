@@ -1,6 +1,6 @@
 arch: ResNet50
 aug: true
-batch_size: 1024
+batch_size: 512
 ckpt: ''
 color_dist_s: 0.5
 config_file: null
@@ -30,4 +30,4 @@ weight_decay: 1.0e-06
 workers: 2
 world_size: 1
 w_simclr: 1
-w_augclr: 0
+w_augclr: 0.5

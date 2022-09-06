@@ -1,6 +1,8 @@
 from argparse import Namespace, ArgumentParser
 
 import os
+from typing import Tuple
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -21,6 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 import copy
+
 
 class BaseSSL(nn.Module):
     """
@@ -113,6 +116,7 @@ class BaseSSL(nn.Module):
             for base in cls.__bases__:
                 base.add_model_hparams(parser)
             add_model_hparams(cls, parser)
+
         return foo
 
     @classmethod
@@ -132,11 +136,12 @@ class SimCLR(BaseSSL):
         # data params
         parser.add_argument('--multiplier', default=2, type=int)
         parser.add_argument('--color_dist_s', default=1., type=float, help='Color distortion strength')
-        parser.add_argument('--scale_lower', default=0.08, type=float, help='The minimum scale factor for RandomResizedCrop')
+        parser.add_argument('--scale_lower', default=0.08, type=float,
+                            help='The minimum scale factor for RandomResizedCrop')
         # ddp
         parser.add_argument('--sync_bn', default=True, type=bool,
-            help='Syncronises BatchNorm layers between all processes if True'
-        )
+                            help='Syncronises BatchNorm layers between all processes if True'
+                            )
         parser.add_argument("--w_simclr", default=1, type=float, help="SimCLR loss weight")
         parser.add_argument("--w_augclr", default=0, type=float, help="AugCLR loss weight")
 
@@ -145,15 +150,16 @@ class SimCLR(BaseSSL):
 
         self.hparams.dist = getattr(self.hparams, 'dist', 'dp')
 
-
         model = models.encoder.Encode2Project(hparams)
-
 
         self.reset_parameters()
         if device is not None:
             model = model.to(device)
 
-
+        self.model = model
+        convnet = model.convnet
+        p_simclr = model.projection_simclr
+        p_augclr = model.projection_augclr
 
         if self.hparams.dist == 'ddp':
             if self.hparams.sync_bn:
@@ -163,23 +169,23 @@ class SimCLR(BaseSSL):
             if device is not None:
                 model = model.to(device)
 
-            convnet = model.convnet
-            p_simclr = model.projection_simclr
-            p_augclr = model.projection_augclr
             self.m_convnet = DDP(convnet, [hparams.gpu], find_unused_parameters=True)
             self.m_p_simclr = DDP(p_simclr, [hparams.gpu], find_unused_parameters=True)
             self.m_p_augclr = DDP(p_augclr, [hparams.gpu], find_unused_parameters=True)
 
             # self.model = DDP(model, [hparams.gpu], find_unused_parameters=True)
         elif self.hparams.dist == 'dp':
-            raise NotImplementedError
-            self.model = nn.DataParallel(model)
+            # raise NotImplementedError
+            DP = nn.DataParallel
+            self.m_convnet = DP(convnet, [hparams.gpu])
+            self.m_p_simclr = DP(p_simclr, [hparams.gpu])
+            self.m_p_augclr = DP(p_augclr, [hparams.gpu])
         else:
             raise NotImplementedError
 
         self.criterion = models.losses.NTXent(
             tau=hparams.temperature,
-            multiplier=2, #hparams.multiplier,
+            multiplier=2,  # hparams.multiplier,
             distributed=(hparams.dist == 'ddp'),
         )
 
@@ -202,7 +208,6 @@ class SimCLR(BaseSSL):
             elif isinstance(m, nn.Linear):
                 linear_normal_init(m.weight)
 
-
     def loss_augclr(self, images, transforms):
         b, c, h, w = images.shape
 
@@ -221,14 +226,12 @@ class SimCLR(BaseSSL):
 
         features_reproj = self.m_p_augclr(features)
 
-
         loss, acc = self.criterion(features_reproj)
-        print("augclr", (b,c,h,w), features_reproj.shape)
-        print(loss.item())
+        # print("augclr", (b,c,h,w), features_reproj.shape)
+        # print(loss.item())
         # print(acc)
         # print("augclr", loss, acc)
         return loss, acc
-
 
     def loss_simclr(self, images, transforms):
         b, c, h, w = images.shape
@@ -241,16 +244,23 @@ class SimCLR(BaseSSL):
         features = self.m_convnet(images)
         proj = self.m_p_simclr(features)
 
+        # print("img", (images.min().item(), images.max().item()))
+        # print("ftr", (features.min().item(), features.max().item()))
+        # print("prj", (proj.min().item(), proj.max().item()))
 
         loss, acc = self.criterion(proj)
 
-        print("simclr", (b,c,h,w), proj.shape)
-
-        print(loss.item())
+        # print("simclr", (b,c,h,w), proj.shape, loss.item())
         # print(acc)
 
-        return loss, acc
+        if torch.isnan(loss):
+            import matplotlib.pyplot as plt
+            for i, img in enumerate(images):
+                plt.imshow(img.permute(1, 2, 0).cpu().detach().numpy())
+                plt.title(str(torch.any(torch.isnan(img))))
+                plt.savefig(f"{i}.png")
 
+        return loss, acc
 
     def step(self, batch, train: bool):
         train_transforms, test_transforms = self.transforms()
@@ -258,6 +268,7 @@ class SimCLR(BaseSSL):
         x, _ = batch
 
         loss_simclr, acc_simclr = self.loss_simclr(x, transforms)
+
         loss_augclr, acc_augclr = self.loss_augclr(x, transforms)
 
         loss = (self.hparams.w_simclr * loss_simclr) + (self.hparams.w_augclr * loss_augclr)
@@ -269,12 +280,6 @@ class SimCLR(BaseSSL):
             "acc_augclr": acc_augclr,
             "loss": loss,
         }
-
-    # def encode(self, x):
-    #     return self.model(x, out='h')
-    #
-    # def forward(self, *args, **kwargs):
-    #     return self.model(*args, **kwargs)
 
     def train_step(self, batch, it=None):
 
@@ -303,22 +308,30 @@ class SimCLR(BaseSSL):
 
         batch_sampler = datautils.MultiplyBatchSampler
         # batch_sampler.MULTILPLIER = self.hparams.multiplier if self.hparams.dist == 'dp' else 1
-        assert self.hparams.multiplier == 1,  self.hparams.multiplier
+        assert self.hparams.multiplier == 1, self.hparams.multiplier
         batch_sampler.MULTILPLIER = self.hparams.multiplier
 
         # need for DDP to sync samplers between processes
         self.trainsampler = trainsampler
         self.batch_trainsampler = batch_sampler(trainsampler, self.hparams.batch_size, drop_last=True)
 
-
         return (
             self.batch_trainsampler,
             batch_sampler(testsampler, self.hparams.batch_size, drop_last=True)
         )
 
-
     def transforms(self):
+        def safe_trans(t):
+            def trans(x):
+                r = t(x)
+                if torch.any(torch.isnan(r)):
+                    return trans(x)
+                return r
+
+            return trans
+
         if self.hparams.data == 'cifar':
+
             train_transform = transforms.Compose([
                 transforms.RandomResizedCrop(
                     32,
@@ -332,6 +345,7 @@ class SimCLR(BaseSSL):
             ])
             test_transform = train_transform
 
+
         elif self.hparams.data == 'imagenet':
             from utils.datautils import GaussianBlur
 
@@ -343,13 +357,14 @@ class SimCLR(BaseSSL):
                     interpolation=PIL.Image.BICUBIC,
                 ),
                 transforms.RandomHorizontalFlip(0.5),
+                # TODO - for some reason, color distorition randomly turns images into NaNs (?)
                 datautils.get_color_distortion(s=self.hparams.color_dist_s),
                 transforms.ToTensor(),
                 GaussianBlur(im_size // 10, 0.5),
                 datautils.Clip(),
             ])
             test_transform = train_transform
-        return train_transform, test_transform
+        return safe_trans(train_transform), safe_trans(test_transform)
 
     def get_ckpt(self):
         return {
@@ -370,8 +385,16 @@ class SimCLR(BaseSSL):
         if k.startswith('model.module'):
             super().load_state_dict(state)
         else:
-
-            self.model.module.load_state_dict(state)
+            try:
+                self.m_convnet.module.load_state_dict(state["convnet"])
+                self.m_p_simclr.module.load_state_dict(state["proj_simclr"])
+                self.m_p_augclr.module.load_state_dict(state["pro_augclr"])
+            except:
+                state = {
+                    (k if k.startswith("convnet") else k.replace("projection", "projection_simclr")): v
+                    for k, v in state.items()
+                }
+                self.model.load_state_dict(state, strict=False)
 
 
 class SSLEval(BaseSSL):
@@ -381,11 +404,12 @@ class SSLEval(BaseSSL):
         parser.add_argument('--test_bs', default=256, type=int)
         parser.add_argument('--encoder_ckpt', default='', help='Path to the encoder checkpoint')
         parser.add_argument('--precompute_emb_bs', default=-1, type=int,
-            help='If it\'s not equal to -1 embeddings are precomputed and fixed before training with batch size equal to this.'
-        )
+                            help='If it\'s not equal to -1 embeddings are precomputed and fixed before training with batch size equal to this.'
+                            )
         parser.add_argument('--finetune', default=False, type=bool, help='Finetunes the encoder if True')
         parser.add_argument('--augmentation', default='RandomResizedCrop', help='')
-        parser.add_argument('--scale_lower', default=0.08, type=float, help='The minimum scale factor for RandomResizedCrop')
+        parser.add_argument('--scale_lower', default=0.08, type=float,
+                            help='The minimum scale factor for RandomResizedCrop')
 
     def __init__(self, hparams, device=None):
         super().__init__(hparams)
@@ -418,6 +442,10 @@ class SSLEval(BaseSSL):
         elif hparams.data == 'imagenet':
             hdim = self.encode(torch.ones(10, 3, 224, 224).to(device)).shape[1]
             n_classes = 1000
+        else:
+            raise NotImplementedError(hparams.data)
+
+        self.hdim = hdim
 
         if hparams.arch == 'linear':
             model = nn.Linear(hdim, n_classes).to(device)
@@ -425,7 +453,7 @@ class SSLEval(BaseSSL):
             model.bias.data.zero_()
             self.model = model
         else:
-            raise NotImplementedError
+            raise NotImplementedError()
 
         if hparams.dist == 'ddp':
             self.model = DDP(model, [hparams.gpu])
@@ -497,7 +525,7 @@ class SSLEval(BaseSSL):
                 self.encoder.eval()
                 self.testset = create_emb_dataset(self.testset)
                 self.trainset = create_emb_dataset(self.trainset)
-        
+
         print(f'Train size: {len(self.trainset)}')
         print(f'Test size: {len(self.testset)}')
 
@@ -565,7 +593,7 @@ class SSLEval(BaseSSL):
                 ),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                lambda x: (255*x).byte(),
+                lambda x: (255 * x).byte(),
             ])
             test_transform = transforms.Compose([
                 datautils.CenterCropAndResize(proportion=0.875, size=224),
@@ -594,6 +622,51 @@ class SSLEval(BaseSSL):
                 self.model.module.load_state_dict(state)
             else:
                 self.model.load_state_dict(state)
+
+
+class SSLEvalChannelMean(SSLEval):
+    @classmethod
+    @BaseSSL.add_parent_hparams
+    def add_model_hparams(cls, parser):
+        pass
+
+    def __init__(self, hparams, device=None):
+        super().__init__(hparams, device=device)
+
+        assert hparams.arch == "linear"
+
+        model = nn.Linear(self.hdim, 3).to(device)
+        model.weight.data.zero_()
+        model.bias.data.zero_()
+        self.model = model
+
+        if hparams.dist == 'ddp':
+            self.model = DDP(model, [hparams.gpu])
+
+
+
+    def step(self, batch: Tuple[torch.Tensor, torch.Tensor]):
+        if self.hparams.problem == 'eval' and self.hparams.data == 'imagenet':
+            batch[0] = batch[0] / 255.
+
+        X, y = batch
+        if self.hparams.precompute_emb_bs == -1:
+            h = self.encode(X)
+        p = self.model(h)
+
+        # h.shape = [b,c,h,w]
+        b, c, h, w = X.shape
+        channel_means = X.mean(dim=[2,3])
+        assert channel_means.shape == (b,c)
+
+        loss = F.mse_loss(channel_means, p)
+        # loss = F.cross_entropy(p, y)
+        # acc = (p.argmax(1) == y).float()
+        return {
+            'loss': loss,
+            # 'acc': acc,
+        }
+
 
 class SemiSupervisedEval(SSLEval):
     @classmethod

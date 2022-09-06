@@ -53,7 +53,10 @@ class NTXent(nn.Module):
         n = z.shape[0]
         assert n % self.multiplier == 0
 
+        # print("z", torch.any(torch.isnan(z)))
+
         z = F.normalize(z, p=2, dim=1) / np.sqrt(self.tau)
+        # print("norm_z", torch.any(torch.isnan(z)))
 
         if self.distributed:
             z_list = [torch.zeros_like(z) for _ in range(dist.get_world_size())]
@@ -71,6 +74,7 @@ class NTXent(nn.Module):
             n = z.shape[0]
 
         logits = z @ z.t()
+        # print("logits", torch.any(torch.isnan(logits)))
         logits[np.arange(n), np.arange(n)] = -self.LARGE_NUMBER
 
         logprob = F.log_softmax(logits, dim=1)

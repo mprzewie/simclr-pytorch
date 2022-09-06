@@ -14,7 +14,7 @@ eval_freq: 1000
 finetune: false
 iters: 80000
 log_freq: 100
-lr: 0.1
+lr: 0.001
 lr_schedule: linear
 model_id: -1
 n_augs_test: 50
@@ -23,7 +23,7 @@ name: ''
 node_rank: 0
 opt: sgd
 precompute_emb_bs: -1
-problem: eval
+problem: eval-channel_mean
 root: ''
 save_freq: 100000000
 scale_lower: 0.08
